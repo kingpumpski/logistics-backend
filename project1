@@ -1,0 +1,180 @@
+# server.js - Main entry point for the backend
+
+const express = require('express');
+const mongoose = require('mongoose');
+const dotenv = require('dotenv');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const nodemailer = require('nodemailer');
+twilio = require('twilio');
+const admin = require('firebase-admin');
+const User = require('./models/User');
+const Shipment = require('./models/Shipment');
+const authRoutes = require('./routes/auth');
+const shipmentRoutes = require('./routes/shipment');
+const driverRoutes = require('./routes/driver');
+const publicRoutes = require('./routes/public');
+const { Server } = require('socket.io');
+const http = require('http');
+
+# Load environment variables
+dotenv.config();
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+
+// Middleware
+app.use(express.json());
+app.use(cors());
+
+// Database Connection
+mongoose.connect(process.env.MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+}).then(() => console.log('MongoDB Connected'))
+  .catch(err => console.log(err));
+
+// Email Notification Setup
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER || 'user@example.com',
+        pass: process.env.EMAIL_PASS || 'password'
+    }
+});
+
+const emailTemplates = {
+    "pending": "Your shipment is pending and will be processed soon.",
+    "dispatched": "Your shipment has been dispatched and is on its way.",
+    "in_transit": "Your shipment is currently in transit.",
+    "out_for_delivery": "Your shipment is out for delivery.",
+    "delivered": "Your shipment has been successfully delivered. Thank you!"
+};
+
+const sendEmailNotification = (to, status) => {
+    const subject = "Shipment Status Update";
+    const text = emailTemplates[status] || "Shipment status updated.";
+    const mailOptions = {
+        from: process.env.EMAIL_USER || 'user@example.com',
+        to,
+        subject,
+        text
+    };
+    transporter.sendMail(mailOptions, (error, info) => {
+        if (error) {
+            console.log('Error sending email:', error);
+        } else {
+            console.log('Email sent:', info.response);
+        }
+    });
+};
+
+// SMS Notification Setup (Twilio)
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+const smsTemplates = {
+    "pending": "Your shipment is pending and will be processed soon.",
+    "dispatched": "Your shipment has been dispatched and is on its way.",
+    "in_transit": "Your shipment is currently in transit.",
+    "out_for_delivery": "Your shipment is out for delivery.",
+    "delivered": "Your shipment has been successfully delivered. Thank you!"
+};
+
+const sendSMSNotification = (to, status) => {
+    const message = smsTemplates[status] || "Shipment status updated.";
+    twilioClient.messages.create({
+        body: message,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to
+    }).then(message => console.log(`SMS sent: ${message.sid}`))
+      .catch(error => console.log('Error sending SMS:', error));
+};
+
+// Push Notification Setup (Firebase)
+admin.initializeApp({
+    credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_CREDENTIALS)),
+});
+
+const pushTemplates = {
+    "pending": "Your shipment is pending and will be processed soon.",
+    "dispatched": "Your shipment has been dispatched and is on its way.",
+    "in_transit": "Your shipment is currently in transit.",
+    "out_for_delivery": "Your shipment is out for delivery.",
+    "delivered": "Your shipment has been successfully delivered. Thank you!"
+};
+
+const sendPushNotification = (deviceToken, status) => {
+    const message = {
+        notification: {
+            title: "Shipment Status Update",
+            body: pushTemplates[status] || "Shipment status updated."
+        },
+        token: deviceToken
+    };
+
+    admin.messaging().send(message)
+        .then(response => console.log(`Push notification sent: ${response}`))
+        .catch(error => console.log('Error sending push notification:', error));
+};
+
+// Middleware to verify JWT and roles
+const verifyToken = (req, res, next) => {
+    const token = req.headers['authorization'];
+    if (!token) return res.status(403).json({ message: 'No token provided' });
+    
+    jwt.verify(token.split(' ')[1], process.env.JWT_SECRET, (err, decoded) => {
+        if (err) return res.status(401).json({ message: 'Unauthorized' });
+        req.user = decoded;
+        next();
+    });
+};
+
+const authorizeRole = (roles) => {
+    return (req, res, next) => {
+        if (!roles.includes(req.user.role)) {
+            return res.status(403).json({ message: 'Forbidden: Insufficient privileges' });
+        }
+        next();
+    };
+};
+
+// Real-time shipment tracking
+io.on('connection', (socket) => {
+    console.log('Client connected:', socket.id);
+    
+    socket.on('updateLocation', ({ shipmentId, location, status, deviceToken }) => {
+        io.emit(`shipment_${shipmentId}_update`, { location, status });
+        
+        // Send SMS, email, and push notifications
+        Shipment.findById(shipmentId).then(shipment => {
+            if (shipment) {
+                if (shipment.customerPhone) {
+                    sendSMSNotification(shipment.customerPhone, status);
+                }
+                if (shipment.customerEmail) {
+                    sendEmailNotification(shipment.customerEmail, status);
+                }
+                if (deviceToken) {
+                    sendPushNotification(deviceToken, status);
+                }
+            }
+        }).catch(err => console.log('Error fetching shipment:', err));
+    });
+    
+    socket.on('disconnect', () => {
+        console.log('Client disconnected:', socket.id);
+    });
+});
+
+// Public Shipment Tracking Route
+app.use('/api/public', publicRoutes);
+
+// Restricted Routes
+app.use('/api/shipments', verifyToken, shipmentRoutes);
+app.use('/api/drivers', verifyToken, authorizeRole(['driver']), driverRoutes);
+
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
